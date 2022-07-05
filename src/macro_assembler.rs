@@ -1,5 +1,5 @@
 use super::*;
-use crate::assembler_buffer::AssemblerLabel;
+use crate::{assembler_buffer::AssemblerLabel, link_buffer::LinkBuffer};
 use std::{
     fmt::Debug,
     ops::{Deref, DerefMut},
@@ -125,17 +125,17 @@ impl BaseIndex {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PreIndexAddress {
     pub base: RegisterId,
-    pub offset: i32,
+    pub index: i32,
 }
 
 impl PreIndexAddress {
-    pub const fn new(base: RegisterId, offset: i32) -> Self {
-        Self { base, offset }
+    pub const fn new(base: RegisterId, index: i32) -> Self {
+        Self { base, index }
     }
 
-    pub const fn with_offset(self, offset: i32) -> Self {
+    pub const fn with_offset(self, index: i32) -> Self {
         Self {
-            offset: self.offset + offset,
+            index: self.index + index,
             ..self
         }
     }
@@ -150,17 +150,17 @@ impl PreIndexAddress {
 
 pub struct PostIndexAddress {
     pub base: RegisterId,
-    pub offset: i32,
+    pub index: i32,
 }
 
 impl PostIndexAddress {
-    pub const fn new(base: RegisterId, offset: i32) -> Self {
-        Self { base, offset }
+    pub const fn new(base: RegisterId, index: i32) -> Self {
+        Self { base, index }
     }
 
-    pub const fn with_offset(self, offset: i32) -> Self {
+    pub const fn with_offset(self, index: i32) -> Self {
         Self {
-            offset: self.offset + offset,
+            index: self.index + index,
             ..self
         }
     }
@@ -180,6 +180,17 @@ pub struct AbsoluteAddress {
 impl AbsoluteAddress {
     pub const fn new(ptr: *mut u8) -> Self {
         Self { ptr }
+    }
+}
+
+pub struct ExtendedAddress {
+    pub base: RegisterId,
+    pub offset: isize,
+}
+
+impl ExtendedAddress {
+    pub const fn new(base: RegisterId, offset: isize) -> Self {
+        Self { base, offset }
     }
 }
 
@@ -440,9 +451,42 @@ impl JumpList {
     }
 }
 
-pub trait MacroAssembler: Sized {
-    type Call: Copy + Clone + PartialEq + Eq + Debug = Call;
+pub trait Assembler {
+    fn get_difference_between_labels(a: AssemblerLabel, b: AssemblerLabel) -> isize;
+    fn link_jump(code: *mut u8, jump: Jump, target: *mut u8);
+    fn link_pointer(code: *mut u8, label: AssemblerLabel, value: *mut u8);
 
+    fn get_linker_address(code: *mut u8, label: AssemblerLabel) -> *mut u8;
+
+    fn get_linker_call_return_offset(label: AssemblerLabel) -> usize;
+
+    fn repatch_jump(jump: *mut u8, destination: *mut u8);
+    fn relink_tail_call(code: *mut u8, destination: *mut u8);
+    fn relink_call(code: *mut u8, destination: *mut u8);
+
+    fn repatch_near_call(tail: bool, near_call: *mut u8, destination: *mut u8) {
+        if tail {
+            Self::relink_tail_call(near_call, destination);
+        } else {
+            Self::relink_call(near_call, destination);
+        }
+    }
+
+    fn repatch_int32(at: *mut u8, value: i32);
+
+    fn repatch_pointer(at: *mut u8, value: *mut u8);
+
+    fn read_pointer(at: *mut u8) -> *mut u8;
+
+    fn replace_with_load(label: *mut u8);
+    fn replace_with_address_computation(label: *mut u8);
+}
+
+pub trait MacroAssembler: Sized {
+    type GR;
+    type FR;
+    type Call: Copy + Clone + PartialEq + Eq + Debug = Call;
+    type AssemblerType;
     fn first_register() -> RegisterId;
     fn last_register() -> RegisterId;
     fn number_of_registers() -> usize;
@@ -455,12 +499,12 @@ pub trait MacroAssembler: Sized {
     fn last_fp_register() -> RegisterId;
     fn number_of_fp_registers() -> usize;
 
-    fn link_call(code: *mut u8, from: AssemblerLabel, function: *mut u8);
+    fn link_call(code: *mut u8, call: Call, function: *mut u8);
     fn link_jump(code: *mut u8, from: AssemblerLabel, to: *mut u8);
     fn link_pointer(code: *mut u8, at: AssemblerLabel, value_ptr: *mut u8);
     fn compute_jump_type(typ: JumpType, from: *const u8, to: *const u8) -> JumpLinkType;
     fn jump_size_delta(typ: JumpType, link: JumpLinkType) -> i32;
-    fn can_compact(typ: JumpLinkType) -> bool;
+    fn can_compact(typ: JumpType) -> bool;
     fn get_call_return_offset(label: AssemblerLabel) -> usize;
 
     fn get_linker_call_return_offset(call: Call) -> usize {
@@ -484,4 +528,68 @@ pub trait MacroAssembler: Sized {
 
     fn link_jump_(&mut self, j: Jump);
     fn link_to(&mut self, j: Jump, label: Label);
+
+    fn clear_temp_register_valid(&mut self, r: usize) {
+        let _ = r;
+    }
+
+    fn is_temp_register_valid(&self, r: usize) -> bool {
+        let _ = r;
+        false
+    }
+
+    fn set_temp_register_valid(&mut self, r: usize) {
+        let _ = r;
+    }
+
+    fn invalidate_all_temp_registers(&mut self) {}
 }
+
+pub struct AbstractMacroAssembler<ASM> {
+    assembler: ASM,
+}
+
+#[derive(Copy, Clone)]
+pub struct CachedTempRegister {
+    reg: RegisterId,
+    value: isize,
+    valid_bit: usize,
+}
+
+impl CachedTempRegister {
+    pub fn new(reg: RegisterId) -> Self {
+        Self {
+            reg,
+            value: 0,
+            valid_bit: 1 << reg as usize,
+        }
+    }
+    pub fn register_id_invalidate(&mut self, masm: &mut impl MacroAssembler) -> RegisterId {
+        self.invalidate(masm);
+        self.reg
+    }
+
+    pub fn register_id_no_invalidate(&mut self) -> RegisterId {
+        self.reg
+    }
+
+    pub fn value(&self, masm: &impl MacroAssembler, value: &mut isize) -> bool {
+        *value = self.value;
+        masm.is_temp_register_valid(self.valid_bit)
+    }
+
+    pub fn set_value(&mut self, masm: &mut impl MacroAssembler, value: isize) {
+        self.value = value;
+        masm.set_temp_register_valid(self.valid_bit);
+    }
+
+    pub fn invalidate(&mut self, masm: &mut impl MacroAssembler) {
+        masm.clear_temp_register_valid(self.valid_bit);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub mod arm64;
+
+#[cfg(target_arch = "aarch64")]
+pub use arm64::*;

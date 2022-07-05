@@ -44,6 +44,20 @@ pub const fn is_valid_scaled_uimm12<const DATASIZE: i32>(offset: i32) -> bool {
     }
 }
 
+pub const fn is_valid_scaled_uimm12_2(datasize: i32, offset: i32) -> bool {
+    let max_pimm = 4095 * (datasize / 8);
+
+    if offset < 8 {
+        false
+    } else if offset > max_pimm {
+        false
+    } else if (offset & ((datasize / 8) - 1)) != 0 {
+        false
+    } else {
+        true
+    }
+}
+
 pub const fn is_valid_signed_imm9(value: i32) -> bool {
     is_int9(value)
 }

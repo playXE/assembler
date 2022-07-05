@@ -1,10 +1,14 @@
 #![allow(non_snake_case)]
-use std::{hint, mem::size_of, mem::transmute};
+use std::{mem::size_of, mem::transmute};
+
+pub const fn max_jump_replacement_size() -> usize {
+    4
+}
 
 use crate::{
     assembler_buffer::{AssemblerBuffer, AssemblerLabel},
-    assembler_common::{is_int9, is_uint12},
-    macro_assembler::{Jump, Label},
+    assembler_common::{is_int9, is_uint12, is_valid_signed_imm7},
+    macro_assembler::{Assembler, Jump, Label},
 };
 
 #[macro_use]
@@ -65,6 +69,16 @@ for_each_fp_register!(register_id);
 pub const INVALID_FP_REG: i8 = -1;
 pub const INVALID_GP_REG: i8 = -1;
 pub const INVALID_SP_REG: i8 = -1;
+
+pub fn is_valid_ldpimm(datasize: i32, immediate: i32) -> bool {
+    let shift = mem_pair_offset_shifted(false, mem_pair_op_size_int(datasize));
+    is_valid_signed_imm7(immediate, shift as _)
+}
+
+pub fn is_valid_fpimm(datasize: i32, immediate: i32) -> bool {
+    let shift = mem_pair_offset_shifted(false, mem_pair_op_size_fp(datasize));
+    is_valid_signed_imm7(immediate, shift as _)
+}
 
 pub const fn is_sp(reg: RegisterId) -> bool {
     reg == sp
@@ -198,7 +212,11 @@ impl Into<PairPreIndex> for i32 {
 }
 
 pub fn get_half_word(value: u64, which: i32) -> u16 {
-    (value >> (which << 4) as u64) as _
+    (value.wrapping_shr((which << 4) as u32)) as _
+}
+
+pub fn get_half_word32(value: u32, which: i32) -> u16 {
+    (value >> (which << 4) as u32) as _
 }
 
 const fn jump_enum_with_size(index: usize, value: usize) -> usize {
@@ -493,7 +511,38 @@ impl ARM64Assembler {
 
         result
     }
+    pub fn label_ignoring_watchpoints(&mut self) -> AssemblerLabel {
+        self.buffer.label()
+    }
 
+    pub fn label_for_watchpoint(&mut self) -> AssemblerLabel {
+        let mut result = self.buffer.label();
+        if result.offset() as usize != self.index_of_last_watchpoint {
+            result = self.label();
+        }
+        self.index_of_last_watchpoint = result.offset() as _;
+        self.index_of_tail_of_last_watchpoint =
+            result.offset() as usize + max_jump_replacement_size();
+        result
+    }
+    pub fn align(&mut self, alignment: usize) -> AssemblerLabel {
+        while !self.buffer.is_aligned(alignment) {
+            self.brk(0);
+        }
+
+        self.label()
+    }
+
+    pub fn get_relocated_address(code: *mut u8, label: AssemblerLabel) -> *mut u8 {
+        unsafe { code.add(label.offset() as _) }
+    }
+
+    pub fn get_difference_between_labels(a: AssemblerLabel, b: AssemblerLabel) -> isize {
+        b.offset() as isize - a.offset() as isize
+    }
+    pub fn get_call_return_offset(call: AssemblerLabel) -> u32 {
+        call.offset()
+    }
     pub fn insn(&mut self, instruction: i32) {
         self.buffer.put_int(instruction);
     }
@@ -1177,6 +1226,10 @@ impl ARM64Assembler {
         ))
     }
 
+    pub fn ldr(&mut self, sf: i32, rt: RegisterId, rn: RegisterId, rm: RegisterId) {
+        self.ldr_extended(sf, rt, rn, rm, ExtendOp::UXTX, 0);
+    }
+
     pub fn ldr_extended(
         &mut self,
         sf: i32,
@@ -1262,7 +1315,9 @@ impl ARM64Assembler {
         rn: RegisterId,
         rm: RegisterId,
         extend: ExtendOp,
+        amount: i32,
     ) {
+        let _ = amount;
         self.insn(load_store_register_offset(
             MemOpSIZE::S8or128,
             false,
@@ -1822,6 +1877,10 @@ impl ARM64Assembler {
         self.sub_shifted(sf, s, rd, zr, rm, shift, amount)
     }
 
+    pub fn ngc(&mut self, sf: i32, s: SetFlags, rd: RegisterId, rm: RegisterId) {
+        self.sbc(sf, s, rd, zr, rm);
+    }
+
     pub fn orn(&mut self, sf: i32, rd: RegisterId, rn: RegisterId, rm: RegisterId) {
         self.orn_shifted(sf, rd, rn, rm, ShiftType::LSL, 0);
     }
@@ -1944,6 +2003,1342 @@ impl ARM64Assembler {
             DataOp2Source::RORV,
             rn,
             rd,
+        ))
+    }
+
+    pub fn sbc(&mut self, sf: i32, s: SetFlags, rd: RegisterId, rn: RegisterId, rm: RegisterId) {
+        self.insn(add_subtract_with_carry(
+            datasize(sf),
+            AddOp::SUB,
+            s,
+            rm,
+            rn,
+            rd,
+        ))
+    }
+
+    pub unsafe fn fill_nops(base: *mut u8, size: usize) {
+        let mut n = size / size_of::<u32>();
+
+        let mut ptr = base.cast::<u32>();
+        while n > 0 {
+            let insn = nop_pseudo();
+            ptr.write(insn as _);
+            ptr = ptr.add(1);
+            n -= 1;
+        }
+    }
+
+    pub fn dmbish(&mut self) {
+        self.insn(0xd5033bbfu32 as _);
+    }
+
+    pub fn dmbishst(&mut self) {
+        self.insn(0xd5033abfu32 as _);
+    }
+
+    pub fn ldar(&mut self, sf: i32, src: RegisterId, dst: RegisterId) {
+        self.insn(exotic_load(
+            memopsize(sf),
+            ExoticLoadFence::Acquire,
+            ExoticLoadAtomic::None,
+            dst,
+            src,
+        ))
+    }
+
+    pub fn ldxr(&mut self, sf: i32, src: RegisterId, dst: RegisterId) {
+        self.insn(exotic_load(
+            memopsize(sf),
+            ExoticLoadFence::None,
+            ExoticLoadAtomic::Link,
+            dst,
+            src,
+        ))
+    }
+
+    pub fn ldaxr(&mut self, sf: i32, src: RegisterId, dst: RegisterId) {
+        self.insn(exotic_load(
+            memopsize(sf),
+            ExoticLoadFence::Acquire,
+            ExoticLoadAtomic::Link,
+            dst,
+            src,
+        ))
+    }
+
+    pub fn stxr(&mut self, sf: i32, result: RegisterId, src: RegisterId, dst: RegisterId) {
+        self.insn(exotic_store(
+            memopsize(sf),
+            ExoticStoreFence::None,
+            result,
+            src,
+            dst,
+        ))
+    }
+    pub fn stlxr(&mut self, sf: i32, result: RegisterId, src: RegisterId, dst: RegisterId) {
+        self.insn(exotic_store(
+            memopsize(sf),
+            ExoticStoreFence::Release,
+            result,
+            src,
+            dst,
+        ))
+    }
+    pub fn stlr(&mut self, sf: i32, src: RegisterId, dst: RegisterId) {
+        self.insn(store_release(memopsize(sf), src, dst))
+    }
+
+    pub fn sbfm(&mut self, sf: i32, rd: RegisterId, rn: RegisterId, immr: i32, imms: i32) {
+        self.insn(bitfield(datasize(sf), BitfieldOp::SBFM, immr, imms, rn, rd))
+    }
+
+    pub fn sbfiz(&mut self, sf: i32, rd: RegisterId, rn: RegisterId, lsb: i32, width: i32) {
+        let datasize = sf;
+        self.sbfm(sf, rd, rn, (datasize - lsb) & (datasize - 1), width - 1);
+    }
+
+    pub fn sbfx(&mut self, sf: i32, rd: RegisterId, rn: RegisterId, lsb: i32, width: i32) {
+        self.sbfm(sf, rd, rn, lsb, lsb + width - 1);
+    }
+
+    pub fn sdiv(&mut self, sf: i32, rd: RegisterId, rn: RegisterId, rm: RegisterId) {
+        self.insn(data_processing_2source(
+            datasize(sf),
+            rm,
+            DataOp2Source::SDIV,
+            rn,
+            rd,
+        ))
+    }
+
+    pub fn smaddl(
+        &mut self,
+        sf: i32,
+        rd: RegisterId,
+        rn: RegisterId,
+        rm: RegisterId,
+        ra: RegisterId,
+    ) {
+        self.insn(data_processing_3source(
+            datasize(sf),
+            DataOp3Source::SMADDL,
+            rm,
+            ra,
+            rn,
+            rd,
+        ))
+    }
+
+    pub fn smnegl(&mut self, sf: i32, rd: RegisterId, rn: RegisterId, rm: RegisterId) {
+        self.smsubl(sf, rd, rn, rm, zr);
+    }
+
+    pub fn smsubl(
+        &mut self,
+        sf: i32,
+        rd: RegisterId,
+        rn: RegisterId,
+        rm: RegisterId,
+        ra: RegisterId,
+    ) {
+        self.insn(data_processing_3source(
+            datasize(sf),
+            DataOp3Source::SMSUBL,
+            rm,
+            ra,
+            rn,
+            rd,
+        ))
+    }
+
+    pub fn smulh(
+        &mut self,
+        sf: i32,
+        rd: RegisterId,
+        rn: RegisterId,
+        rm: RegisterId,
+        ra: RegisterId,
+    ) {
+        self.insn(data_processing_3source(
+            datasize(sf),
+            DataOp3Source::SMULH,
+            rm,
+            ra,
+            rn,
+            rd,
+        ))
+    }
+    pub fn stp_pair_post_index(
+        &mut self,
+        sf: i32,
+        rt: RegisterId,
+        rt2: RegisterId,
+        rn: RegisterId,
+        imm: i32,
+    ) {
+        self.insn(load_store_register_pair_post_index(
+            mem_pair_op_size_int(sf),
+            false,
+            MemOp::STORE,
+            imm,
+            rn,
+            rt,
+            rt2,
+        ))
+    }
+
+    pub fn stp_pair_pre_index(
+        &mut self,
+        sf: i32,
+        rt: RegisterId,
+        rt2: RegisterId,
+        rn: RegisterId,
+        imm: i32,
+    ) {
+        self.insn(load_store_register_pair_pre_index(
+            mem_pair_op_size_int(sf),
+            false,
+            MemOp::STORE,
+            imm,
+            rn,
+            rt,
+            rt2,
+        ))
+    }
+
+    pub fn stp_offset(
+        &mut self,
+        sf: i32,
+        rt: RegisterId,
+        rt2: RegisterId,
+        rn: RegisterId,
+        imm: i32,
+    ) {
+        self.insn(load_store_register_pair_offset(
+            mem_pair_op_size_int(sf),
+            false,
+            MemOp::STORE,
+            imm,
+            rn,
+            rt,
+            rt2,
+        ))
+    }
+
+    pub fn stnp(&mut self, sf: i32, rt: RegisterId, rt2: RegisterId, rn: RegisterId, imm: i32) {
+        self.insn(load_store_register_pair_non_temporal(
+            mem_pair_op_size_int(sf),
+            false,
+            MemOp::STORE,
+            imm,
+            rn,
+            rt,
+            rt2,
+        ))
+    }
+
+    pub fn stp_fp_post_index(
+        &mut self,
+        sf: i32,
+        rt: RegisterId,
+        rt2: RegisterId,
+        rn: RegisterId,
+        imm: i32,
+    ) {
+        self.insn(load_store_register_pair_post_index(
+            mem_pair_op_size_fp(sf),
+            true,
+            MemOp::STORE,
+            imm,
+            rn,
+            rt,
+            rt2,
+        ))
+    }
+
+    pub fn stp_fp_pre_index(
+        &mut self,
+        sf: i32,
+        rt: RegisterId,
+        rt2: RegisterId,
+        rn: RegisterId,
+        imm: i32,
+    ) {
+        self.insn(load_store_register_pair_pre_index(
+            mem_pair_op_size_fp(sf),
+            true,
+            MemOp::STORE,
+            imm,
+            rn,
+            rt,
+            rt2,
+        ))
+    }
+
+    pub fn stp_fp_offset(
+        &mut self,
+        sf: i32,
+        rt: RegisterId,
+        rt2: RegisterId,
+        rn: RegisterId,
+        imm: i32,
+    ) {
+        self.insn(load_store_register_pair_offset(
+            mem_pair_op_size_fp(sf),
+            true,
+            MemOp::STORE,
+            imm,
+            rn,
+            rt,
+            rt2,
+        ))
+    }
+
+    pub fn stnp_fp(&mut self, sf: i32, rt: RegisterId, rt2: RegisterId, rn: RegisterId, imm: i32) {
+        self.insn(load_store_register_pair_non_temporal(
+            mem_pair_op_size_fp(sf),
+            true,
+            MemOp::STORE,
+            imm,
+            rn,
+            rt,
+            rt2,
+        ))
+    }
+    pub fn str_extend(
+        &mut self,
+        sf: i32,
+        rt: RegisterId,
+        rn: RegisterId,
+        rm: RegisterId,
+        extend: ExtendOp,
+        amount: i32,
+    ) {
+        self.insn(load_store_register_offset_r(
+            memopsize(sf),
+            false,
+            MemOp::STORE,
+            rm,
+            extend,
+            amount != 0,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn str(&mut self, sf: i32, rt: RegisterId, rn: RegisterId, rm: RegisterId) {
+        self.str_extend(sf, rt, rn, rm, ExtendOp::UXTX, 0);
+    }
+
+    pub fn str_pimm(&mut self, sf: i32, rt: RegisterId, rn: RegisterId, imm: usize) {
+        self.insn(load_store_register_unsigned_immediate(
+            memopsize(sf),
+            false,
+            MemOp::STORE,
+            encode_positive_immediate(sf, imm) as _,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn str_post_index(&mut self, sf: i32, rt: RegisterId, rn: RegisterId, imm: i32) {
+        self.insn(load_store_register_post_index(
+            memopsize(sf),
+            false,
+            MemOp::STORE,
+            imm,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn str_pre_index(&mut self, sf: i32, rt: RegisterId, rn: RegisterId, imm: i32) {
+        self.insn(load_store_register_pre_index(
+            memopsize(sf),
+            false,
+            MemOp::STORE,
+            imm,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn strb(&mut self, rt: RegisterId, rn: RegisterId, rm: RegisterId) {
+        self.insn(load_store_register_offset(
+            MemOpSIZE::S8or128,
+            false,
+            MemOp::STORE,
+            rm,
+            ExtendOp::UXTX,
+            false,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn strb_extended(
+        &mut self,
+        rt: RegisterId,
+        rn: RegisterId,
+        rm: RegisterId,
+        extend: ExtendOp,
+        amount: i32,
+    ) {
+        let _ = amount;
+        self.insn(load_store_register_offset_r(
+            MemOpSIZE::S8or128,
+            false,
+            MemOp::STORE,
+            rm,
+            extend,
+            false,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn strb_pimm(&mut self, rt: RegisterId, rn: RegisterId, imm: usize) {
+        self.insn(load_store_register_unsigned_immediate(
+            MemOpSIZE::S8or128,
+            false,
+            MemOp::STORE,
+            encode_positive_immediate(8, imm) as _,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn strb_post_index(&mut self, rt: RegisterId, rn: RegisterId, imm: i32) {
+        self.insn(load_store_register_post_index(
+            MemOpSIZE::S8or128,
+            false,
+            MemOp::STORE,
+            imm,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn strb_pre_index(&mut self, rt: RegisterId, rn: RegisterId, imm: i32) {
+        self.insn(load_store_register_pre_index(
+            MemOpSIZE::S8or128,
+            false,
+            MemOp::STORE,
+            imm,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn strh(&mut self, rt: RegisterId, rn: RegisterId, rm: RegisterId) {
+        self.strh_extended(rt, rn, rm, ExtendOp::UXTX, 0);
+    }
+
+    pub fn strh_extended(
+        &mut self,
+        rt: RegisterId,
+        rn: RegisterId,
+        rm: RegisterId,
+        extend: ExtendOp,
+        amount: i32,
+    ) {
+        self.insn(load_store_register_offset_r(
+            MemOpSIZE::S16,
+            false,
+            MemOp::STORE,
+            rm,
+            extend,
+            amount == 1,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn strh_pimm(&mut self, rt: RegisterId, rn: RegisterId, imm: usize) {
+        self.insn(load_store_register_unsigned_immediate(
+            MemOpSIZE::S16,
+            false,
+            MemOp::STORE,
+            encode_positive_immediate(16, imm) as _,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn strh_post_index(&mut self, rt: RegisterId, rn: RegisterId, imm: i32) {
+        self.insn(load_store_register_post_index(
+            MemOpSIZE::S16,
+            false,
+            MemOp::STORE,
+            imm,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn strh_pre_index(&mut self, rt: RegisterId, rn: RegisterId, imm: i32) {
+        self.insn(load_store_register_pre_index(
+            MemOpSIZE::S16,
+            false,
+            MemOp::STORE,
+            imm,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn stur(&mut self, sf: i32, rt: RegisterId, rn: RegisterId, simm: i32) {
+        self.insn(load_store_register_unscaled_immediate(
+            memopsize(sf),
+            false,
+            MemOp::STORE,
+            simm as _,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn sturb(&mut self, rt: RegisterId, rn: RegisterId, simm: i32) {
+        self.insn(load_store_register_unscaled_immediate(
+            MemOpSIZE::S8or128,
+            false,
+            MemOp::STORE,
+            simm as _,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn sturb_imm(&mut self, rt: RegisterId, rn: RegisterId, simm: i32) {
+        self.insn(load_store_register_unscaled_immediate(
+            MemOpSIZE::S16,
+            false,
+            MemOp::STORE,
+            simm as _,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn sxtb(&mut self, sf: i32, rd: RegisterId, rn: RegisterId) {
+        self.sbfm(sf, rd, rn, 0, 7);
+    }
+
+    pub fn sxth(&mut self, sf: i32, rd: RegisterId, rn: RegisterId) {
+        self.sbfm(sf, rd, rn, 0, 15);
+    }
+
+    pub fn sxtw(&mut self, sf: i32, rd: RegisterId, rn: RegisterId) {
+        self.sbfm(sf, rd, rn, 0, 31);
+    }
+
+    pub fn tbz(&mut self, rt: RegisterId, imm: i32, mut offset: i32) {
+        offset >>= 2;
+        self.insn(test_and_branch_immediate(false, imm, offset, rt))
+    }
+
+    pub fn tbnz(&mut self, rt: RegisterId, imm: i32, mut offset: i32) {
+        offset >>= 2;
+        self.insn(test_and_branch_immediate(true, imm, offset, rt))
+    }
+
+    pub fn tst(&mut self, sf: i32, rn: RegisterId, rm: RegisterId) {
+        self.and(sf, SetFlags::S, zr, rn, rm);
+    }
+
+    pub fn tst_shifted(
+        &mut self,
+        sf: i32,
+        rn: RegisterId,
+        rm: RegisterId,
+        shift: ShiftType,
+        amount: i32,
+    ) {
+        self.and_shifted(sf, SetFlags::S, zr, rn, rm, shift, amount);
+    }
+
+    pub fn tst_imm(&mut self, sf: i32, rn: RegisterId, imm: i32) {
+        self.and_immediate(sf, SetFlags::S, zr, rn, imm)
+    }
+
+    pub fn ubfiz(&mut self, sf: i32, rd: RegisterId, rn: RegisterId, lsb: i32, width: i32) {
+        self.ubfm(sf, rd, rn, (sf - lsb) & (sf - 1), width - 1)
+    }
+    pub fn ubfx(&mut self, sf: i32, rd: RegisterId, rn: RegisterId, lsb: i32, width: i32) {
+        self.ubfm(sf, rd, rn, lsb, lsb + width - 1)
+    }
+
+    pub fn udiv(&mut self, sf: i32, rd: RegisterId, rn: RegisterId, rm: RegisterId) {
+        self.insn(data_processing_2source(
+            datasize(sf),
+            rm,
+            DataOp2Source::UDIV,
+            rn,
+            rd,
+        ));
+    }
+
+    pub fn umaddl(
+        &mut self,
+        sf: i32,
+        rd: RegisterId,
+        rn: RegisterId,
+        rm: RegisterId,
+        ra: RegisterId,
+    ) {
+        self.insn(data_processing_3source(
+            datasize(sf),
+            DataOp3Source::UMADDL,
+            rm,
+            ra,
+            rn,
+            rd,
+        ));
+    }
+
+    pub fn umsubl(
+        &mut self,
+        sf: i32,
+        rd: RegisterId,
+        rn: RegisterId,
+        rm: RegisterId,
+        ra: RegisterId,
+    ) {
+        self.insn(data_processing_3source(
+            datasize(sf),
+            DataOp3Source::UMSUBL,
+            rm,
+            ra,
+            rn,
+            rd,
+        ));
+    }
+
+    pub fn umnegl(&mut self, sf: i32, rd: RegisterId, rn: RegisterId, rm: RegisterId) {
+        self.umsubl(sf, rd, rn, rm, zr);
+    }
+
+    pub fn umulh(&mut self, sf: i32, rd: RegisterId, rn: RegisterId, rm: RegisterId) {
+        self.insn(data_processing_3source(
+            datasize(sf),
+            DataOp3Source::UMULH,
+            rm,
+            zr,
+            rn,
+            rd,
+        ));
+    }
+
+    pub fn umull(&mut self, sf: i32, rd: RegisterId, rn: RegisterId, rm: RegisterId) {
+        self.umaddl(sf, rd, rn, rm, zr);
+    }
+
+    pub fn uxtb(&mut self, sf: i32, rd: RegisterId, rn: RegisterId) {
+        self.ubfm(sf, rd, rn, 0, 7);
+    }
+    pub fn uxth(&mut self, sf: i32, rd: RegisterId, rn: RegisterId) {
+        self.ubfm(sf, rd, rn, 0, 15);
+    }
+
+    pub fn uxtw(&mut self, rd: RegisterId, rn: RegisterId) {
+        self.ubfm(64, rd, rn, 0, 31);
+    }
+    pub fn smull(&mut self, sf: i32, rd: RegisterId, rn: RegisterId, rm: RegisterId) {
+        self.smaddl(sf, rd, rn, rm, zr);
+    }
+
+    // floating point instructions:
+
+    pub fn fabs(&mut self, sf: i32, vd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_data_processing_1source(
+            datasize(sf),
+            FPDataOp1Source::FABS,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn fadd(&mut self, sf: i32, vd: RegisterId, vn: RegisterId, vm: RegisterId) {
+        self.insn(floating_point_data_processing_2source(
+            datasize(sf),
+            vm,
+            FPDataOp2Source::FADD,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn fccmp(&mut self, sf: i32, vn: RegisterId, vm: RegisterId, vnzcv: i32, cond: Condition) {
+        self.insn(floating_point_conditional_compare(
+            datasize(sf),
+            vm,
+            cond,
+            vn,
+            FPCondCmpOp::FCMP,
+            vnzcv,
+        ));
+    }
+
+    pub fn fccmpe(&mut self, sf: i32, vn: RegisterId, vm: RegisterId, vnzcv: i32, cond: Condition) {
+        self.insn(floating_point_conditional_compare(
+            datasize(sf),
+            vm,
+            cond,
+            vn,
+            FPCondCmpOp::FCMPE,
+            vnzcv,
+        ));
+    }
+
+    pub fn fcmp(&mut self, sf: i32, vn: RegisterId, vm: RegisterId) {
+        self.insn(floating_point_compare(datasize(sf), vm, vn, FPCmpOp::FCMP));
+    }
+
+    pub fn fcmp_0(&mut self, sf: i32, vn: RegisterId) {
+        self.insn(floating_point_compare(datasize(sf), 0, vn, FPCmpOp::FCMP0));
+    }
+
+    pub fn fcmpe(&mut self, sf: i32, vn: RegisterId, vm: RegisterId) {
+        self.insn(floating_point_compare(datasize(sf), vm, vn, FPCmpOp::FCMPE));
+    }
+
+    pub fn fcmpe_0(&mut self, sf: i32, vn: RegisterId) {
+        self.insn(floating_point_compare(datasize(sf), 0, vn, FPCmpOp::FCMPE0));
+    }
+
+    pub fn fcsel(
+        &mut self,
+        sf: i32,
+        vd: RegisterId,
+        vn: RegisterId,
+        vm: RegisterId,
+        cond: Condition,
+    ) {
+        self.insn(floating_point_conditional_select(
+            datasize(sf),
+            vm,
+            cond,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn fcvt(&mut self, dstsize: i32, srcsize: i32, vd: RegisterId, vn: RegisterId) {
+        let typ = if srcsize == 64 {
+            Datasize::D64
+        } else if srcsize == 32 {
+            Datasize::D32
+        } else {
+            Datasize::D16
+        };
+        let opcode = if dstsize == 64 {
+            FPDataOp1Source::FCVT2DOUBLE
+        } else if dstsize == 32 {
+            FPDataOp1Source::FCVT2SINGLE
+        } else {
+            FPDataOp1Source::FCVT2HALF
+        };
+
+        self.insn(floating_point_data_processing_1source(typ, opcode, vn, vd));
+    }
+
+    pub fn fcvtas(&mut self, dstsize: i32, srcsize: i32, rd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_integer_convertions(
+            datasize(dstsize),
+            datasize(srcsize),
+            FPIntConvOp::FCVTAS,
+            vn,
+            rd,
+        ));
+    }
+
+    pub fn fcvtau(&mut self, dstsize: i32, srcsize: i32, rd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_integer_convertions(
+            datasize(dstsize),
+            datasize(srcsize),
+            FPIntConvOp::FCVTAU,
+            vn,
+            rd,
+        ));
+    }
+
+    pub fn fcvtms(&mut self, dstsize: i32, srcsize: i32, rd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_integer_convertions(
+            datasize(dstsize),
+            datasize(srcsize),
+            FPIntConvOp::FCVTMS,
+            vn,
+            rd,
+        ));
+    }
+
+    pub fn fcvtmu(&mut self, dstsize: i32, srcsize: i32, rd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_integer_convertions(
+            datasize(dstsize),
+            datasize(srcsize),
+            FPIntConvOp::FCVTMU,
+            vn,
+            rd,
+        ));
+    }
+
+    pub fn fcvtns(&mut self, dstsize: i32, srcsize: i32, rd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_integer_convertions(
+            datasize(dstsize),
+            datasize(srcsize),
+            FPIntConvOp::FCVTNS,
+            vn,
+            rd,
+        ));
+    }
+
+    pub fn fcvtnu(&mut self, dstsize: i32, srcsize: i32, rd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_integer_convertions(
+            datasize(dstsize),
+            datasize(srcsize),
+            FPIntConvOp::FCVTNU,
+            vn,
+            rd,
+        ));
+    }
+
+    pub fn fcvtps(&mut self, dstsize: i32, srcsize: i32, rd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_integer_convertions(
+            datasize(dstsize),
+            datasize(srcsize),
+            FPIntConvOp::FCVTPS,
+            vn,
+            rd,
+        ));
+    }
+
+    pub fn fcvtpu(&mut self, dstsize: i32, srcsize: i32, rd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_integer_convertions(
+            datasize(dstsize),
+            datasize(srcsize),
+            FPIntConvOp::FCVTPU,
+            vn,
+            rd,
+        ));
+    }
+
+    pub fn fcvtzs(&mut self, dstsize: i32, srcsize: i32, rd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_integer_convertions(
+            datasize(dstsize),
+            datasize(srcsize),
+            FPIntConvOp::FCVTZS,
+            vn,
+            rd,
+        ));
+    }
+
+    pub fn fcvtzu(&mut self, dstsize: i32, srcsize: i32, rd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_integer_convertions(
+            datasize(dstsize),
+            datasize(srcsize),
+            FPIntConvOp::FCVTZU,
+            vn,
+            rd,
+        ));
+    }
+
+    pub fn fdiv(&mut self, sf: i32, vd: RegisterId, vn: RegisterId, vm: RegisterId) {
+        self.insn(floating_point_data_processing_2source(
+            datasize(sf),
+            vm,
+            FPDataOp2Source::FDIV,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn fmadd(
+        &mut self,
+        sf: i32,
+        vd: RegisterId,
+        vn: RegisterId,
+        vm: RegisterId,
+        va: RegisterId,
+    ) {
+        self.insn(floating_point_data_processing_3source(
+            datasize(sf),
+            false,
+            vm,
+            AddOp::ADD,
+            va,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn fmax(&mut self, sf: i32, vd: RegisterId, vn: RegisterId, vm: RegisterId) {
+        self.insn(floating_point_data_processing_2source(
+            datasize(sf),
+            vm,
+            FPDataOp2Source::FMAX,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn fmaxnm(&mut self, sf: i32, vd: RegisterId, vn: RegisterId, vm: RegisterId) {
+        self.insn(floating_point_data_processing_2source(
+            datasize(sf),
+            vm,
+            FPDataOp2Source::FMAXNM,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn fmin(&mut self, sf: i32, vd: RegisterId, vn: RegisterId, vm: RegisterId) {
+        self.insn(floating_point_data_processing_2source(
+            datasize(sf),
+            vm,
+            FPDataOp2Source::FMIN,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn fminnm(&mut self, sf: i32, vd: RegisterId, vn: RegisterId, vm: RegisterId) {
+        self.insn(floating_point_data_processing_2source(
+            datasize(sf),
+            vm,
+            FPDataOp2Source::FMINNM,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn fmov(&mut self, sf: i32, vd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_data_processing_1source(
+            datasize(sf),
+            FPDataOp1Source::FMOV,
+            vn,
+            vd,
+        ))
+    }
+
+    pub fn fmov_x2q(&mut self, sf: i32, rd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_integer_convertions_fr(
+            datasize(sf),
+            datasize(sf),
+            FPIntConvOp::FMOVQtoX,
+            vn,
+            rd,
+        ))
+    }
+
+    pub fn fmov_imm(&mut self, sf: i32, rd: RegisterId, imm: f64) {
+        self.insn(floating_point_immediate(
+            datasize(sf),
+            encode_fp_imm(imm),
+            rd,
+        ))
+    }
+
+    pub fn fmov_q2x(&mut self, sf: i32, vd: RegisterId, rn: RegisterId) {
+        self.insn(floating_point_integer_convertions_rr(
+            datasize(sf),
+            datasize(sf),
+            FPIntConvOp::FMOVXtoQ,
+            rn,
+            vd,
+        ))
+    }
+
+    pub fn fmov_x2q_top(&mut self, sf: i32, rd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_integer_convertions_fr(
+            datasize(sf),
+            datasize(sf),
+            FPIntConvOp::FMOVXtoQtop,
+            vn,
+            rd,
+        ))
+    }
+
+    pub fn fmov_q2x_top(&mut self, sf: i32, vd: RegisterId, rn: RegisterId) {
+        self.insn(floating_point_integer_convertions_rr(
+            datasize(sf),
+            datasize(sf),
+            FPIntConvOp::FMOVQtoXtop,
+            rn,
+            vd,
+        ))
+    }
+
+    pub fn fmsub(&mut self, sf: i32, vd: RegisterId, vn: RegisterId, vm: RegisterId) {
+        self.insn(floating_point_data_processing_3source(
+            datasize(sf),
+            false,
+            vm,
+            AddOp::SUB,
+            vn,
+            vd,
+            vd,
+        ));
+    }
+
+    pub fn fmul(&mut self, sf: i32, vd: RegisterId, vn: RegisterId, vm: RegisterId) {
+        self.insn(floating_point_data_processing_2source(
+            datasize(sf),
+            vm,
+            FPDataOp2Source::FMUL,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn fneg(&mut self, sf: i32, vd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_data_processing_1source(
+            datasize(sf),
+            FPDataOp1Source::FNEG,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn fnmadd(
+        &mut self,
+        sf: i32,
+        vd: RegisterId,
+        vn: RegisterId,
+        vm: RegisterId,
+        va: RegisterId,
+    ) {
+        self.insn(floating_point_data_processing_3source(
+            datasize(sf),
+            true,
+            vm,
+            AddOp::ADD,
+            va,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn fnmsub(&mut self, sf: i32, vd: RegisterId, vn: RegisterId, vm: RegisterId) {
+        self.insn(floating_point_data_processing_3source(
+            datasize(sf),
+            true,
+            vm,
+            AddOp::SUB,
+            vn,
+            vd,
+            vd,
+        ));
+    }
+
+    pub fn fnmul(&mut self, sf: i32, vd: RegisterId, vn: RegisterId, vm: RegisterId) {
+        self.insn(floating_point_data_processing_2source(
+            datasize(sf),
+            vm,
+            FPDataOp2Source::FNMUL,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn vand(&mut self, vd: RegisterId, vn: RegisterId, vm: RegisterId) {
+        self.insn(vector_processing_logical(SIMD3SameLogical::AND, vm, vn, vd));
+    }
+
+    pub fn vorr(&mut self, vd: RegisterId, vn: RegisterId, vm: RegisterId) {
+        self.insn(vector_processing_logical(SIMD3SameLogical::ORR, vm, vn, vd));
+    }
+
+    pub fn frinta(&mut self, sf: i32, vd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_data_processing_1source(
+            datasize(sf),
+            FPDataOp1Source::FRINTA,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn frinti(&mut self, sf: i32, vd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_data_processing_1source(
+            datasize(sf),
+            FPDataOp1Source::FRINTI,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn frintm(&mut self, sf: i32, vd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_data_processing_1source(
+            datasize(sf),
+            FPDataOp1Source::FRINTM,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn frintn(&mut self, sf: i32, vd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_data_processing_1source(
+            datasize(sf),
+            FPDataOp1Source::FRINTN,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn frintp(&mut self, sf: i32, vd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_data_processing_1source(
+            datasize(sf),
+            FPDataOp1Source::FRINTP,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn frintx(&mut self, sf: i32, vd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_data_processing_1source(
+            datasize(sf),
+            FPDataOp1Source::FRINTX,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn frintz(&mut self, sf: i32, vd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_data_processing_1source(
+            datasize(sf),
+            FPDataOp1Source::FRINTZ,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn fsqrt(&mut self, sf: i32, vd: RegisterId, vn: RegisterId) {
+        self.insn(floating_point_data_processing_1source(
+            datasize(sf),
+            FPDataOp1Source::FSQRT,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn fsub(&mut self, sf: i32, vd: RegisterId, vn: RegisterId, vm: RegisterId) {
+        self.insn(floating_point_data_processing_2source(
+            datasize(sf),
+            vm,
+            FPDataOp2Source::FSUB,
+            vn,
+            vd,
+        ));
+    }
+
+    pub fn ldr_f_extended(
+        &mut self,
+        sf: i32,
+        rt: RegisterId,
+        rn: RegisterId,
+        rm: RegisterId,
+        extend: ExtendOp,
+        amount: i32,
+    ) {
+        self.insn(load_store_register_offset_r(
+            memopsize(sf),
+            true,
+            if sf == 128 {
+                MemOp::LOADV128
+            } else {
+                MemOp::LOAD
+            },
+            rm,
+            extend,
+            amount != 0,
+            rn,
+            rt,
+        ));
+    }
+
+    pub fn ldr_f(&mut self, sf: i32, rt: RegisterId, rn: RegisterId, rm: RegisterId) {
+        self.ldr_f_extended(sf, rt, rn, rm, ExtendOp::UXTX, 0);
+    }
+
+    pub fn ldr_f_pimm(&mut self, sf: i32, rt: RegisterId, rn: RegisterId, pimm: usize) {
+        self.insn(load_store_register_unsigned_immediate_r(
+            memopsize(sf),
+            true,
+            if sf == 128 {
+                MemOp::LOADV128
+            } else {
+                MemOp::LOAD
+            },
+            encode_positive_immediate(sf, pimm),
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn ldr_f_post_index(&mut self, sf: i32, rt: RegisterId, rn: RegisterId, simm: i32) {
+        self.insn(load_store_register_post_index_r(
+            memopsize(sf),
+            true,
+            if sf == 128 {
+                MemOp::LOADV128
+            } else {
+                MemOp::LOAD
+            },
+            simm,
+            rn,
+            rt,
+        ));
+    }
+
+    pub fn ldr_f_pre_index(&mut self, sf: i32, rt: RegisterId, rn: RegisterId, simm: i32) {
+        self.insn(load_store_register_pre_index_r(
+            memopsize(sf),
+            true,
+            if sf == 128 {
+                MemOp::LOADV128
+            } else {
+                MemOp::LOAD
+            },
+            simm,
+            rn,
+            rt,
+        ));
+    }
+
+    pub fn ldr_f_literal(&mut self, sf: i32, rt: RegisterId, offset: i32) {
+        self.insn(load_register_literal_r(
+            if sf == 128 {
+                LDR_LITERAL_OP_128BIT
+            } else {
+                LDR_LITERAL_OP_64BIT
+            },
+            true,
+            offset >> 2,
+            rt,
+        ))
+    }
+
+    pub fn ldur_f(&mut self, sf: i32, rt: RegisterId, rn: RegisterId, simm: i32) {
+        self.insn(load_store_register_unscaled_immediate_r(
+            memopsize(sf),
+            true,
+            if sf == 128 {
+                MemOp::LOADV128
+            } else {
+                MemOp::LOAD
+            },
+            simm,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn str_f_extended(
+        &mut self,
+        sf: i32,
+        rt: RegisterId,
+        rn: RegisterId,
+        rm: RegisterId,
+        extend: ExtendOp,
+        amount: i32,
+    ) {
+        self.insn(load_store_register_offset_r(
+            memopsize(sf),
+            true,
+            if sf == 128 {
+                MemOp::STOREV128
+            } else {
+                MemOp::STORE
+            },
+            rm,
+            extend,
+            amount != 0,
+            rn,
+            rt,
+        ));
+    }
+
+    pub fn str_f(&mut self, sf: i32, rt: RegisterId, rn: RegisterId, rm: RegisterId) {
+        self.str_f_extended(sf, rt, rn, rm, ExtendOp::UXTX, 0);
+    }
+
+    pub fn str_f_pimm(&mut self, sf: i32, rt: RegisterId, rn: RegisterId, pimm: usize) {
+        self.insn(load_store_register_unsigned_immediate_r(
+            memopsize(sf),
+            true,
+            if sf == 128 {
+                MemOp::STOREV128
+            } else {
+                MemOp::STORE
+            },
+            encode_positive_immediate(sf, pimm),
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn str_f_post_index(&mut self, sf: i32, rt: RegisterId, rn: RegisterId, simm: i32) {
+        self.insn(load_store_register_post_index_r(
+            memopsize(sf),
+            true,
+            if sf == 128 {
+                MemOp::STOREV128
+            } else {
+                MemOp::STORE
+            },
+            simm,
+            rn,
+            rt,
+        ));
+    }
+
+    pub fn str_f_pre_index(&mut self, sf: i32, rt: RegisterId, rn: RegisterId, simm: i32) {
+        self.insn(load_store_register_pre_index_r(
+            memopsize(sf),
+            true,
+            if sf == 128 {
+                MemOp::STOREV128
+            } else {
+                MemOp::STORE
+            },
+            simm,
+            rn,
+            rt,
+        ));
+    }
+
+    pub fn stur_f(&mut self, sf: i32, rt: RegisterId, rn: RegisterId, simm: i32) {
+        self.insn(load_store_register_unscaled_immediate_r(
+            memopsize(sf),
+            true,
+            if sf == 128 {
+                MemOp::STOREV128
+            } else {
+                MemOp::STORE
+            },
+            simm,
+            rn,
+            rt,
+        ))
+    }
+
+    pub fn scvtf(&mut self, dstsize: i32, srcsize: i32, vd: RegisterId, rn: RegisterId) {
+        self.insn(floating_point_integer_convertions_fr(
+            datasize(srcsize),
+            datasize(dstsize),
+            FPIntConvOp::SCVTF,
+            rn,
+            vd,
+        ))
+    }
+
+    pub fn ucvtf(&mut self, dstsize: i32, srcsize: i32, vd: RegisterId, rn: RegisterId) {
+        self.insn(floating_point_integer_convertions_fr(
+            datasize(srcsize),
+            datasize(dstsize),
+            FPIntConvOp::UCVTF,
+            rn,
+            vd,
         ))
     }
 }
@@ -2088,7 +3483,7 @@ pub enum FPDataOp1Source {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum FPDataOp2Source {
-    FMULL,
+    FMUL,
     FDIV,
     FADD,
     FSUB,
@@ -2774,6 +4169,19 @@ pub fn extract(sf: Datasize, rm: RegisterId, imms: i32, rn: RegisterId, rd: Regi
         | xOrZr(rd)
 }
 
+pub fn floating_point_immediate(typ: Datasize, imm8: i32, rd: RegisterId) -> i32 {
+    let M = 0;
+    let S = 0;
+    let imm5 = 0;
+    0x1e201000
+        | M << 31
+        | S << 29
+        | (typ as i32) << 22
+        | (imm8 & 0xff) << 13
+        | imm5 << 5
+        | rd as i32
+}
+
 pub fn floating_point_compare(
     typ: Datasize,
     rm: RegisterId,
@@ -3383,7 +4791,7 @@ pub fn store_release(size: MemOpSIZE, src: RegisterId, dst: RegisterId) -> i32 {
 
 pub fn exotic_store(
     size: MemOpSIZE,
-    fence: ExoticLoadFence,
+    fence: ExoticStoreFence,
     result: RegisterId,
     src: RegisterId,
     dst: RegisterId,
@@ -3459,14 +4867,14 @@ pub unsafe fn repatch_int32(at: *mut u8, value: i32) {
             Datasize::D32,
             MoveWideOp::Z,
             0,
-            get_half_word(value as _, 0) as _,
+            get_half_word32(value as _, 0) as _,
             rd,
         );
         buffer[1] = move_wide_immediate(
             Datasize::D32,
             MoveWideOp::K,
             1,
-            get_half_word(value as _, 1) as _,
+            get_half_word32(value as _, 1) as _,
             rd,
         );
     } else {
@@ -3474,14 +4882,14 @@ pub unsafe fn repatch_int32(at: *mut u8, value: i32) {
             Datasize::D32,
             MoveWideOp::N,
             0,
-            !get_half_word(value as _, 0) as _,
+            !get_half_word32(value as _, 0) as _,
             rd,
         );
         buffer[1] = move_wide_immediate(
             Datasize::D32,
             MoveWideOp::K,
             1,
-            get_half_word(value as _, 1) as _,
+            get_half_word32(value as _, 1) as _,
             rd,
         );
     }
@@ -3791,7 +5199,7 @@ pub unsafe fn replace_with_address_computation(at: *mut u8) {
 
 pub unsafe fn replace_with_load(at: *mut u8) {
     let mut size = Datasize::D32;
-    let mut v = false;
+    //let mut v = false;
 
     let mut imm12 = 0;
     let mut rn = 0;
@@ -3866,5 +5274,61 @@ impl ARM64Assembler {
             address_of(code, from).sub(1),
             to,
         )
+    }
+}
+
+impl Assembler for ARM64Assembler {
+    fn link_jump(code: *mut u8, jump: Jump, target: *mut u8) {
+        unsafe {
+            ARM64Assembler::link_jump(code, jump.label, target);
+        }
+    }
+
+    fn get_difference_between_labels(a: AssemblerLabel, b: AssemblerLabel) -> isize {
+        a.offset() as isize - b.offset() as isize
+    }
+
+    fn link_pointer(code: *mut u8, label: AssemblerLabel, value: *mut u8) {
+        unsafe { ARM64Assembler::link_pointer(code, label, value) }
+    }
+
+    fn get_linker_address(code: *mut u8, label: AssemblerLabel) -> *mut u8 {
+        ARM64Assembler::get_relocated_address(code, label)
+    }
+
+    fn read_pointer(at: *mut u8) -> *mut u8 {
+        unsafe { read_pointer(at) }
+    }
+
+    fn get_linker_call_return_offset(label: AssemblerLabel) -> usize {
+        label.offset() as _
+    }
+
+    fn relink_call(code: *mut u8, destination: *mut u8) {
+        unsafe { relink_call(code, destination) }
+    }
+
+    fn relink_tail_call(code: *mut u8, destination: *mut u8) {
+        unsafe { relink_tail_call(code, destination) }
+    }
+
+    fn repatch_int32(at: *mut u8, value: i32) {
+        unsafe { repatch_int32(at, value) }
+    }
+
+    fn repatch_pointer(at: *mut u8, value: *mut u8) {
+        unsafe { repatch_pointer(at, value) }
+    }
+
+    fn repatch_jump(jump: *mut u8, destination: *mut u8) {
+        unsafe { relink_jump(jump, destination) }
+    }
+
+    fn replace_with_load(label: *mut u8) {
+        unsafe { replace_with_load(label) }
+    }
+
+    fn replace_with_address_computation(label: *mut u8) {
+        unsafe { replace_with_address_computation(label) }
     }
 }

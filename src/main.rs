@@ -1,10 +1,14 @@
 use capstone::{arch::arm64::ArchMode, prelude::*};
-use masm::arm64::*;
+use masm::{
+    arm64::*,
+    macro_assembler::{Address, BaseIndex, MacroAssemblerARM64, Scale, GR},
+};
+
+fn foo() {}
 
 fn main() {
-    let mut asm = ARM64Assembler::new();
-
-    asm.mov(64, x0, x2);
+    let mut asm = MacroAssemblerARM64::new();
+    asm.store64_imm(1, Address::new(x0, 42));
     let mut cs = Capstone::new().arm64().mode(ArchMode::Arm).build().unwrap();
     cs.set_skipdata(true).unwrap();
 
